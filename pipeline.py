@@ -539,7 +539,13 @@ def print_property(label: str, p: dict):
 
 # ── Main pipeline ───────────────────────────────────────────────────────────────
 
-async def run_pipeline(address: str, radius_miles: float, tolerance: float, sold_days: int, input_address: str = ""):
+async def run_pipeline(address: str, radius_miles: float, tolerance: float, sold_days: int,
+                       input_address: str = "", progress_cb=None):
+    def _log(msg: str):
+        print(msg)
+        if progress_cb:
+            progress_cb(msg)
+
     async with async_playwright() as pw:
         browser, ctx = await build_context(pw)
         try:
@@ -548,37 +554,39 @@ async def run_pipeline(address: str, radius_miles: float, tolerance: float, sold
             await page.add_init_script(STEALTH_SCRIPT)
 
             # ── 1. Geocode ─────────────────────────────────────────────────────
-            print(f"\n[1] Geocoding: {address}")
-            # Need a warm page for Nominatim fetch to work
+            _log(f"[1/7] Geocoding: {address}")
             await page.goto("https://nominatim.openstreetmap.org", wait_until="domcontentloaded", timeout=20_000)
             await asyncio.sleep(1)
             geo = await geocode(page, address)
-            print(f"    lat={geo['lat']:.6f}  lng={geo['lng']:.6f}  zip={geo['zip']}  city={geo['city']}  state={geo['state']}")
+            _log(f"      lat={geo['lat']:.6f}  lng={geo['lng']:.6f}  zip={geo['zip']}  city={geo['city']}")
 
             # ── 2. Discover Redfin region ──────────────────────────────────────
-            print(f"\n[2] Discovering Redfin region for zip={geo['zip']}...")
+            # Must warm the Redfin session first — navigating to Nominatim clears Redfin cookies
+            _log(f"[2/7] Warming Redfin session...")
+            await page.goto("https://www.redfin.com", wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(2)
+            _log(f"[2/7] Discovering Redfin region for zip={geo['zip']}...")
             region = await discover_region(page, geo["zip"], geo["city"], geo["state"])
-            print(f"    market={region['market']}  region_id={region['region_id']}  region_type={region['region_type']}")
+            _log(f"      market={region['market']}  region_id={region['region_id']}  region_type={region['region_type']}")
 
             # ── 3. Fetch all listings in the region ───────────────────────────
-            print(f"\n[3] Fetching listings...")
+            _log(f"[3/7] Fetching listings...")
             raw_listings = await gis_fetch_all(page, region["market"], region["region_id"], region["region_type"], max_pages=3)
             all_props = [parse_home(h) for h in raw_listings]
-            print(f"    {len(all_props)} properties from Redfin")
+            _log(f"      {len(all_props)} properties from Redfin")
 
-            # Filter to radius
             nearby = filter_nearby(all_props, geo["lat"], geo["lng"], radius_miles)
-            print(f"    {len(nearby)} within {radius_miles} mile(s)")
+            _log(f"      {len(nearby)} within {radius_miles} mile(s)")
 
             # ── 4. Identify subject property ──────────────────────────────────
+            _log(f"[4/7] Identifying subject property...")
             subject = find_subject_in_listings(all_props, geo["lat"], geo["lng"])
             if subject:
                 dist = haversine_miles(geo["lat"], geo["lng"], subject.get("latitude") or 0, subject.get("longitude") or 0)
-                match_note = "exact match" if dist < 0.05 else f"closest active listing, {dist:.2f} mi from geocoded point — subject may be off-market"
-                print_property(f"[4] Subject property  [{match_note}]", subject)
+                match_note = "exact match" if dist < 0.05 else f"closest listing ({dist:.2f} mi)"
+                _log(f"      {subject.get('street')}  [{match_note}]  {fmt_price(subject.get('price'))}")
             else:
-                print("\n[4] Subject property not found in any listings (off-market)")
-                # Build a synthetic subject from geocode + address string
+                _log("      Subject not found in active listings (off-market)")
                 subject = {
                     "property_id": None, "listing_id": None, "mls_number": None,
                     "mls_status": "Unknown", "street": address, "unit": None,
@@ -594,35 +602,26 @@ async def run_pipeline(address: str, radius_miles: float, tolerance: float, sold
                 }
 
             # ── 5. Filter comparables ─────────────────────────────────────────
+            _log(f"[5/7] Filtering comparables (±{int(tolerance*100)}% sqft/lot)...")
             comps = filter_comparables(subject, nearby, tolerance)
-            print(f"\n[5] Comparables: {len(comps)} properties within ±{int(tolerance*100)}% sqft/lot")
-            for p in comps[:5]:
-                sq_s = f"sqft={p.get('sqft')} ({p.get('pct_diff_sqft'):+.0f}%)" if p.get('pct_diff_sqft') is not None else f"sqft={p.get('sqft')}"
-                lot_s = f"lot={p.get('lot_size')} ({p.get('pct_diff_lot'):+.0f}%)" if p.get('pct_diff_lot') is not None else f"lot={p.get('lot_size')}"
-                print(f"    {p.get('distance_miles'):.2f}mi | {p.get('street')} | {fmt_price(p.get('price'))} | {sq_s} | {lot_s} | {p.get('mls_status')}")
-            if len(comps) > 5:
-                print(f"    ... and {len(comps)-5} more")
+            _log(f"      {len(comps)} comparables found")
 
             # ── 6. Fetch recent sales in the area ─────────────────────────────
-            print(f"\n[6] Fetching recent sales (last {sold_days} days)...")
+            _log(f"[6/7] Fetching recent sales (last {sold_days} days)...")
             raw_sales = await gis_fetch_all(page, region["market"], region["region_id"], region["region_type"],
                                             sold_within_days=sold_days, max_pages=5)
             all_sales  = [parse_home(h) for h in raw_sales if h.get("mlsStatus") in ("Closed", "Sold")]
             area_sales = filter_nearby(all_sales, geo["lat"], geo["lng"], radius_miles)
-            print(f"    {len(area_sales)} sales within {radius_miles} mile(s)")
+            _log(f"      {len(area_sales)} sales within {radius_miles} mile(s)")
 
-            # Filter sales that match our comparables (by property_id)
             comp_ids = {p.get("property_id") for p in comps}
             comp_sales = [s for s in area_sales if s.get("property_id") in comp_ids]
-
-            # Also include any sales that pass the 20% filter
             for s in area_sales:
                 if s.get("property_id") not in comp_ids:
                     s_filtered = filter_comparables(subject, [s], tolerance)
                     if s_filtered:
                         comp_sales.append(s_filtered[0])
 
-            # Deduplicate
             seen = set()
             unique_sales = []
             for s in comp_sales:
@@ -630,30 +629,37 @@ async def run_pipeline(address: str, radius_miles: float, tolerance: float, sold
                 if key not in seen:
                     seen.add(key)
                     unique_sales.append(s)
-
-            print(f"    {len(unique_sales)} sales match comparable criteria")
-            for s in sorted(unique_sales, key=lambda x: x.get("sold_date") or "", reverse=True)[:8]:
-                print(f"    {s.get('sold_date')} | {fmt_price(s.get('price'))} | {s.get('street')}"
-                      f" | sqft={s.get('sqft')} lot={s.get('lot_size')}")
+            _log(f"      {len(unique_sales)} comparable sales")
 
             # ── 7. Store to database ───────────────────────────────────────────
             db_path = db_name(input_address or address, subject)
-            print(f"\n[7] Saving to database: {db_path}")
+            _log(f"[7/7] Saving to: {db_path}")
             conn = init_db(db_path)
-
             insert_subject(conn, subject)
             insert_nearby(conn, nearby)
             insert_comparables(conn, comps)
             insert_sales(conn, unique_sales)
             conn.commit()
-
-            print(f"    subject_property  : 1 record")
-            print(f"    nearby_listings   : {len(nearby)} records")
-            print(f"    comparables       : {len(comps)} records")
-            print(f"    comparable_sales  : {len(unique_sales)} records")
             conn.close()
 
-            return db_path
+            sale_prices = [s["price"] for s in unique_sales if s.get("price")]
+            return {
+                "db_path":      db_path,
+                "subject":      subject,
+                "geo":          geo,
+                "region":       region,
+                "nearby":       nearby,
+                "comparables":  comps,
+                "sales":        unique_sales,
+                "stats": {
+                    "nearby_count":       len(nearby),
+                    "comp_count":         len(comps),
+                    "sales_count":        len(unique_sales),
+                    "avg_sale_price":     round(sum(sale_prices) / len(sale_prices)) if sale_prices else None,
+                    "min_sale_price":     min(sale_prices) if sale_prices else None,
+                    "max_sale_price":     max(sale_prices) if sale_prices else None,
+                },
+            }
 
         finally:
             await ctx.close()
@@ -679,10 +685,11 @@ def main():
     print("=" * 65)
 
     start = time.perf_counter()
-    db_path = asyncio.run(run_pipeline(args.address, args.radius, args.tolerance, args.sold_days, input_address=args.address))
+    result = asyncio.run(run_pipeline(args.address, args.radius, args.tolerance, args.sold_days, input_address=args.address))
     elapsed = time.perf_counter() - start
 
-    print(f"\n  Completed in {elapsed:.1f}s  →  {db_path}")
+    print(f"\n  Completed in {elapsed:.1f}s  →  {result['db_path']}")
+    print(f"  nearby={result['stats']['nearby_count']}  comps={result['stats']['comp_count']}  sales={result['stats']['sales_count']}")
     print("=" * 65)
 
 
