@@ -181,21 +181,53 @@ async def gis_fetch_all(page, market, region_id, region_type, sold_within_days=N
 # ── Pipeline steps ─────────────────────────────────────────────────────────────
 
 async def geocode(page, address: str) -> dict:
-    """Geocode an address via OpenStreetMap Nominatim."""
-    encoded = address.replace(" ", "+").replace(",", "%2C")
-    url = f"https://nominatim.openstreetmap.org/search?q={encoded}&format=json&limit=1&addressdetails=1"
-    _, data = await fetch_json_in_page(page, url)
-    if not data or not isinstance(data, list) or not data:
-        raise RuntimeError(f"Nominatim could not geocode: {address}")
-    geo = data[0]
-    addr = geo.get("address", {})
-    return {
-        "lat":   float(geo["lat"]),
-        "lng":   float(geo["lon"]),
-        "zip":   addr.get("postcode", "").replace(" ", ""),
-        "city":  addr.get("city") or addr.get("town") or addr.get("village") or "",
-        "state": addr.get("state", ""),
-    }
+    """
+    Geocode an address via OpenStreetMap Nominatim.
+    On failure, retries with progressively broader queries (street+city, then city+state)
+    so minor typos or missing unit numbers don't hard-crash the pipeline.
+    """
+    def _encode(q: str) -> str:
+        return q.replace(" ", "+").replace(",", "%2C")
+
+    def _parse(data) -> dict | None:
+        if not data or not isinstance(data, list):
+            return None
+        geo  = data[0]
+        addr = geo.get("address", {})
+        return {
+            "lat":   float(geo["lat"]),
+            "lng":   float(geo["lon"]),
+            "zip":   addr.get("postcode", "").replace(" ", ""),
+            "city":  addr.get("city") or addr.get("town") or addr.get("village") or "",
+            "state": addr.get("state", ""),
+        }
+
+    # Build a set of fallback queries from most to least specific
+    import re as _re
+    parts = [p.strip() for p in _re.split(r",|\s{2,}", address) if p.strip()]
+    queries = [address]                          # 1. full address as given
+    if len(parts) >= 2:
+        queries.append(", ".join(parts[-2:]))    # 2. last two parts (e.g. "City State Zip")
+    if len(parts) >= 1:
+        queries.append(parts[-1])                # 3. last part only (city/state)
+
+    last_err = ""
+    for attempt, q in enumerate(queries, 1):
+        encoded = _encode(q)
+        url = f"https://nominatim.openstreetmap.org/search?q={encoded}&format=json&limit=1&addressdetails=1"
+        _, data = await fetch_json_in_page(page, url)
+        result = _parse(data)
+        if result:
+            if attempt > 1:
+                print(f"    (geocoded using fallback query: '{q}')")
+            return result
+        last_err = q
+
+    raise RuntimeError(
+        f"\n  Geocoding failed for: {address!r}\n"
+        f"  Also tried: {queries[1:]}\n"
+        f"  Check the address spelling and try again."
+    )
 
 
 STATE_ABBR = {
