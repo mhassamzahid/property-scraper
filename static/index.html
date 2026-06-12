@@ -168,6 +168,7 @@
   <section class="fade-in mb-12">
     <div class="flex items-center justify-between mb-4">
       <h2 class="text-xl font-bold text-slate-800 section-title" id="compsTitle">Comparable Properties</h2>
+      <button id="compsToggle" onclick="toggleComps()" class="text-sm text-indigo-600 hover:text-indigo-800 font-medium"></button>
     </div>
     <div id="compsEmpty" class="hidden text-slate-500 text-sm py-8 text-center">No comparables found within ±20% sqft/lot.</div>
     <div id="compsGrid" class="prop-grid"></div>
@@ -177,6 +178,7 @@
   <section class="fade-in mb-12">
     <div class="flex items-center justify-between mb-4">
       <h2 class="text-xl font-bold text-slate-800 section-title" id="salesTitle">Comparable Sales</h2>
+      <button id="salesToggle" onclick="toggleSales()" class="text-sm text-indigo-600 hover:text-indigo-800 font-medium"></button>
     </div>
     <div id="salesEmpty" class="hidden text-slate-500 text-sm py-8 text-center">No comparable sales found in the last 365 days.</div>
     <div id="chartContainer" class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 mb-6">
@@ -208,12 +210,19 @@
 
 <script>
 // ─── State ─────────────────────────────────────────────────────────────────────
-let currentJobId = null;
-let pollTimer    = null;
-let chartInst    = null;
-let nearbyAll    = [];
+let currentJobId  = null;
+let pollTimer     = null;
+let chartInst     = null;
+let nearbyAll     = [];
+let compsAll      = [];
+let saleGroups    = [];
+let _compsSubject = null;
 let nearbyShowAll = false;
+let compsShowAll  = false;
+let salesShowAll  = false;
 const NEARBY_PREVIEW = 8;
+const COMPS_PREVIEW  = 8;
+const SALES_PREVIEW  = 6;
 
 // ─── Utilities ─────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -417,12 +426,27 @@ function toggleNearby() {
 
 // ── Comparables ────────────────────────────────────────────────────────────────
 function renderComps(comps, subject) {
-  $('compsTitle').textContent = `Comparable Properties ±20% (${(comps||[]).length})`;
-  if (!comps || !comps.length) {
+  compsAll = comps || [];
+  _compsSubject = subject;
+  $('compsTitle').textContent = `Comparable Properties ±20% (${compsAll.length})`;
+  if (!compsAll.length) {
     $('compsEmpty').classList.remove('hidden');
     return;
   }
-  $('compsGrid').innerHTML = comps.map(p => compCard(p, subject)).join('');
+  refreshComps();
+}
+
+function refreshComps() {
+  const items = compsShowAll ? compsAll : compsAll.slice(0, COMPS_PREVIEW);
+  $('compsGrid').innerHTML = items.map(p => compCard(p, _compsSubject)).join('');
+  $('compsToggle').textContent = compsShowAll
+    ? '← Show fewer'
+    : (compsAll.length > COMPS_PREVIEW ? `Show all ${compsAll.length} →` : '');
+}
+
+function toggleComps() {
+  compsShowAll = !compsShowAll;
+  refreshComps();
 }
 
 function compCard(p, subject) {
@@ -447,41 +471,128 @@ function compCard(p, subject) {
   </div>`;
 }
 
+// ── Sales helpers ──────────────────────────────────────────────────────────────
+function fmtDate(d) {
+  if (!d) return '—';
+  try {
+    const [y, m, day] = d.split('-').map(Number);
+    return new Date(y, m - 1, day).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  } catch { return d; }
+}
+
+function estimateListDate(soldDate, dom) {
+  if (!soldDate || dom == null || dom <= 0) return null;
+  try {
+    const [y, m, d] = soldDate.split('-').map(Number);
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() - dom);
+    return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+  } catch { return null; }
+}
+
 // ── Sales ──────────────────────────────────────────────────────────────────────
+function groupSalesByProperty(sales) {
+  const map = new Map();
+  for (const s of sales) {
+    const key = s.property_id || s.street || Math.random();
+    if (!map.has(key)) map.set(key, { ...s, events: [] });
+    map.get(key).events.push({
+      date:          s.sold_date,
+      price:         s.price,
+      price_per_sqft: s.price_per_sqft,
+      mls_number:    s.mls_number,
+      dom:           s.dom,
+      listing_broker: s.listing_broker,
+      selling_broker: s.selling_broker,
+      listing_agent:  s.listing_agent,
+    });
+  }
+  for (const g of map.values()) {
+    g.events.sort((a, b) => (b.date || '') > (a.date || '') ? 1 : -1);
+  }
+  return [...map.values()].sort((a, b) =>
+    (b.events[0]?.date || '') > (a.events[0]?.date || '') ? 1 : -1
+  );
+}
+
 function renderSales(sales, subject) {
   sales = sales || [];
-  $('salesTitle').textContent = `Comparable Sales (${sales.length})`;
   if (!sales.length) {
+    $('salesTitle').textContent = 'Comparable Sales (0)';
     $('salesEmpty').classList.remove('hidden');
     $('chartContainer').classList.add('hidden');
     return;
   }
-
-  // Sort by sold_date
   const sorted = [...sales].sort((a, b) => (a.sold_date || '') < (b.sold_date || '') ? -1 : 1);
-
-  // Chart
   buildSalesChart(sorted, subject);
-
-  // Cards
-  $('salesGrid').innerHTML = sorted.map(p => saleCard(p)).join('');
+  saleGroups = groupSalesByProperty(sales);
+  $('salesTitle').textContent = `Comparable Sales — ${saleGroups.length} properties, ${sales.length} transactions`;
+  refreshSales();
 }
 
-function saleCard(p) {
-  return `<div class="bg-white border border-slate-100 rounded-2xl p-4 shadow-sm cursor-pointer card-hover" onclick='openModal(${JSON.stringify(p)}, null, "sale")'>
-    <div class="flex items-center justify-between mb-3">
-      <span class="text-xs font-bold px-2 py-0.5 rounded-full bg-slate-800 text-white uppercase">SOLD</span>
-      ${p.sold_date ? `<span class="text-xs text-slate-400 font-medium">${p.sold_date}</span>` : ''}
+function refreshSales() {
+  const items = salesShowAll ? saleGroups : saleGroups.slice(0, SALES_PREVIEW);
+  $('salesGrid').innerHTML = items.map(g => groupedSaleCard(g)).join('');
+  $('salesToggle').textContent = salesShowAll
+    ? '← Show fewer'
+    : (saleGroups.length > SALES_PREVIEW ? `Show all ${saleGroups.length} →` : '');
+}
+
+function toggleSales() {
+  salesShowAll = !salesShowAll;
+  refreshSales();
+}
+
+// Builds the Redfin-style Date | Event | Price table rows for one sale event
+function saleEventRows(e, isCard) {
+  const listDate = estimateListDate(e.date, e.dom);
+  const textSm = isCard ? 'text-xs' : 'text-sm';
+
+  const closedRow = `
+    <div class="grid grid-cols-[1fr_1.4fr_auto] gap-x-3 items-center py-2 ${isCard ? '' : 'border-b border-slate-100'}">
+      <span class="${textSm} text-slate-700 font-medium">${fmtDate(e.date)}</span>
+      <span class="${textSm} font-semibold text-slate-900">Closed</span>
+      <span class="${textSm} font-bold text-slate-900 text-right">${fmt(e.price)}${e.price_per_sqft ? `<span class="font-normal text-slate-400 ml-1">${fmt(e.price_per_sqft)}/sqft</span>` : ''}</span>
+    </div>`;
+
+  const listedRow = listDate ? `
+    <div class="grid grid-cols-[1fr_1.4fr_auto] gap-x-3 items-center py-2">
+      <span class="${textSm} text-slate-400">${fmtDate(listDate)}</span>
+      <span class="${textSm} text-slate-500">Listed (Active)</span>
+      <span class="${textSm} text-slate-400 text-right">—</span>
+    </div>` : '';
+
+  return closedRow + listedRow;
+}
+
+function groupedSaleCard(g) {
+  const addr2 = [g.city, g.state, g.zip].filter(Boolean).join(', ');
+  const stats  = [
+    g.beds != null ? g.beds + ' bd' : null,
+    g.baths != null ? g.baths + ' ba' : null,
+    g.sqft ? fmtN(g.sqft) + ' sqft' : null,
+    g.lot_size ? fmtN(g.lot_size) + ' lot' : null,
+    g.year_built ? 'Built ' + g.year_built : null,
+  ].filter(Boolean).join(' · ');
+
+  const historyHtml = g.events.map((e, i) => {
+    const mlsHeader = e.mls_number
+      ? `<div class="text-xs text-slate-400 bg-slate-100 rounded px-2 py-1 mb-1 font-medium">MLS# ${e.mls_number}</div>`
+      : '';
+    const divider = i > 0 ? '<div class="border-t border-slate-100 mt-1 mb-2"></div>' : '';
+    return divider + mlsHeader + saleEventRows(e, true);
+  }).join('');
+
+  return `<div class="bg-white border border-slate-100 rounded-2xl shadow-sm cursor-pointer card-hover overflow-hidden" onclick='openSaleGroup(${JSON.stringify(g)})'>
+    <div class="px-4 pt-4 pb-3">
+      <div class="flex items-start justify-between mb-1">
+        <div class="font-bold text-slate-900 text-base leading-tight">${g.street || 'N/A'}</div>
+        ${g.distance_miles != null ? `<span class="text-xs text-slate-400 font-medium ml-2 flex-shrink-0">${g.distance_miles} mi</span>` : ''}
+      </div>
+      <div class="text-xs text-slate-400 mb-2">${addr2}${g.neighborhood ? ' · ' + g.neighborhood : ''}</div>
+      ${stats ? `<div class="text-xs text-slate-500">${stats}</div>` : ''}
     </div>
-    <div class="font-bold text-slate-900 text-base mb-0.5">${fmt(p.price)}</div>
-    <div class="text-sm text-slate-600 mb-3 truncate">${p.street || 'N/A'}</div>
-    <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">
-      ${p.beds != null ? `<span>${p.beds} bd</span>` : ''}
-      ${p.baths != null ? `<span>${p.baths} ba</span>` : ''}
-      ${p.sqft ? `<span>${fmtN(p.sqft)} sqft</span>` : ''}
-      ${p.lot_size ? `<span>${fmtN(p.lot_size)} lot</span>` : ''}
-      ${p.distance_miles != null ? `<span>${p.distance_miles} mi</span>` : ''}
-    </div>
+    <div class="border-t border-slate-200 bg-slate-50/60 px-4 py-2">${historyHtml}</div>
   </div>`;
 }
 
@@ -526,7 +637,7 @@ function buildSalesChart(sales, subject) {
             label: ctx => {
               if (ctx.datasetIndex === 0) {
                 const p = ctx.raw.prop;
-                return [`${fmt(ctx.raw.y)} — ${p.street}`, `${p.sold_date} | ${p.sqft ? fmtN(p.sqft) + ' sqft' : ''}`];
+                return [`${fmt(ctx.raw.y)} — ${p.street}`, `${fmtDate(p.sold_date)}${p.sqft ? ' · ' + fmtN(p.sqft) + ' sqft' : ''}`];
               }
               return `Subject list price: ${fmt(ctx.raw.y)}`;
             }
@@ -542,7 +653,9 @@ function buildSalesChart(sales, subject) {
       },
       onClick: (e, els) => {
         if (els.length && els[0].datasetIndex === 0) {
-          openModal(pts[els[0].index].prop, null, 'sale');
+          const sale = pts[els[0].index].prop;
+          const grp = saleGroups.find(g => g.property_id === sale.property_id && g.street === sale.street) || sale;
+          openSaleGroup(grp.events ? grp : { ...sale, events: [{ date: sale.sold_date, price: sale.price, price_per_sqft: sale.price_per_sqft }] });
         }
       }
     }
@@ -649,6 +762,201 @@ function row(label, value) {
 function closeModal() {
   $('modal').classList.add('hidden');
   document.body.style.overflow = '';
+}
+
+// ─── Sale group modal ───────────────────────────────────────────────────────────
+function openSaleGroup(g) {
+  const addr2 = [g.city, g.state, g.zip].filter(Boolean).join(', ');
+
+  // Build history table inline from GIS data — no async fetch needed
+  const header = `
+    <div class="grid grid-cols-[130px_1fr_auto] gap-x-4 pb-1.5 mb-1 border-b-2 border-slate-200">
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Date</span>
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Event</span>
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide text-right">Price</span>
+    </div>`;
+
+  const historyRows = (g.events || []).map((e, i) => {
+    const mlsHdr = e.mls_number
+      ? `<div class="text-xs font-medium text-slate-500 bg-slate-200/70 rounded px-2.5 py-1 ${i > 0 ? 'mt-3' : ''} mb-1">MLS# ${e.mls_number}</div>`
+      : (i > 0 ? '<div class="border-t border-slate-200 mt-3 mb-2"></div>' : '');
+    const closedRow = `<div class="grid grid-cols-[130px_1fr_auto] gap-x-4 items-start py-2 border-b border-slate-100 last:border-0">
+      <span class="text-sm text-slate-500">${fmtDate(e.date)}</span>
+      <span class="text-sm font-semibold text-slate-900">Closed</span>
+      <span class="text-sm font-bold text-slate-900 text-right">${fmt(e.price)}${e.price_per_sqft ? `<span class="font-normal text-slate-400 text-xs ml-1">${fmt(e.price_per_sqft)}/sqft</span>` : ''}</span>
+    </div>`;
+    return mlsHdr + closedRow;
+  }).join('');
+
+  $('modalContent').innerHTML = `
+    <div class="flex items-start justify-between mb-4">
+      <div class="flex-1 min-w-0">
+        <h3 class="text-xl font-extrabold text-slate-900 mb-0.5">${g.street || 'N/A'}</h3>
+        <div class="text-sm text-slate-500">${addr2}${g.neighborhood ? ' · ' + g.neighborhood : ''}</div>
+        ${g.distance_miles != null ? `<div class="text-xs text-slate-400 mt-0.5">${g.distance_miles} miles from subject</div>` : ''}
+      </div>
+      <button onclick="closeModal()" class="ml-4 flex-shrink-0 text-slate-400 hover:text-slate-700 p-1">
+        <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-5">
+      ${modalStat('Beds',       g.beds)}
+      ${modalStat('Baths',      g.baths)}
+      ${modalStat('Sqft',       g.sqft ? fmtN(g.sqft) : null)}
+      ${modalStat('Lot sqft',   g.lot_size ? fmtN(g.lot_size) : null)}
+      ${modalStat('Price/sqft', g.price_per_sqft ? fmt(g.price_per_sqft) : null)}
+      ${modalStat('Year Built', g.year_built)}
+      ${modalStat('Type',       g.property_type)}
+      ${modalStat('Stories',    g.stories)}
+    </div>
+
+    <div class="mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <h4 class="text-sm font-bold text-slate-700 uppercase tracking-wide">Sale History</h4>
+        ${g.redfin_url ? `<a href="${g.redfin_url}#saleHistory" target="_blank" class="text-xs text-indigo-500 hover:text-indigo-700 font-medium">Full history on Redfin ↗</a>` : ''}
+      </div>
+      <div class="bg-slate-50 rounded-xl px-4 pt-3 pb-3">
+        ${header}${historyRows || '<p class="text-sm text-slate-400 py-2">No recorded transactions.</p>'}
+      </div>
+    </div>
+
+    ${g.listing_agent || g.selling_broker || g.listing_broker ? `
+    <div class="border-t border-slate-100 pt-3 space-y-1.5 text-sm mb-4">
+      ${g.listing_broker ? row('Listing Broker', g.listing_broker) : ''}
+      ${g.selling_broker ? row('Selling Broker', g.selling_broker) : ''}
+      ${g.listing_agent  ? row('Listing Agent',  g.listing_agent)  : ''}
+    </div>` : ''}
+
+    ${g.redfin_url ? `<a href="${g.redfin_url}" target="_blank" class="inline-flex items-center gap-2 bg-red-500 hover:bg-red-600 text-white font-semibold px-5 py-2.5 rounded-xl transition-colors">View on Redfin <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg></a>` : ''}
+  `;
+
+  $('modal').classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+}
+
+function loadPropertyHistory(g) {
+  fetch('/api/property-history?url=' + encodeURIComponent(g.redfin_url))
+    .then(r => r.json())
+    .then(data => {
+      $('historyLoading') && ($('historyLoading').remove());
+      if (data.events && data.events.length > 0) {
+        renderRealHistory(data.events, g);
+      } else {
+        renderFallbackHistory(g);
+      }
+    })
+    .catch(() => {
+      $('historyLoading') && ($('historyLoading').remove());
+      renderFallbackHistory(g);
+    });
+}
+
+// Renders real events from Redfin page (Date | Event | Price rows)
+function renderRealHistory(events, g) {
+  const wrap = $('historyTableBody');
+  if (!wrap) return;
+
+  // Group by MLS number (consecutive events with same mls_number)
+  const groups = [];
+  let cur = null;
+  for (const e of events) {
+    const mls = e.mls_number || null;
+    if (!cur || cur.mls !== mls) {
+      cur = { mls, events: [] };
+      groups.push(cur);
+    }
+    cur.events.push(e);
+  }
+
+  const header = `
+    <div class="grid grid-cols-[130px_1fr_auto] gap-x-4 pb-1.5 mb-1 border-b-2 border-slate-200">
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Date</span>
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Event</span>
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide text-right">Price</span>
+    </div>`;
+
+  const rowsHtml = groups.map((grp, gi) => {
+    const mlsHdr = grp.mls
+      ? `<div class="text-xs font-medium text-slate-500 bg-slate-200/70 rounded px-2.5 py-1 ${gi > 0 ? 'mt-3' : ''} mb-1">MLS# ${grp.mls}</div>`
+      : (gi > 0 ? '<div class="border-t border-slate-200 mt-3 mb-2"></div>' : '');
+
+    const evRows = grp.events.map(e => {
+      const isClosed = /closed|sold/i.test(e.event || '');
+      const isListed = /listed|active/i.test(e.event || '');
+      const isRemoved = /removed|expired/i.test(e.event || '');
+      const isContingent = /contingent/i.test(e.event || '');
+      const isPending = /pending/i.test(e.event || '');
+
+      const eventCls = isClosed ? 'font-semibold text-slate-900'
+                     : isListed ? 'text-green-700 font-medium'
+                     : isRemoved ? 'text-red-600'
+                     : isContingent || isPending ? 'text-amber-700 font-medium'
+                     : 'text-slate-600';
+
+      const rawPrice = e.price;
+      const priceDisplay = !rawPrice || rawPrice === '—' || rawPrice === '*' || rawPrice === ''
+        ? `<span class="text-slate-300">—</span>`
+        : isClosed && typeof rawPrice === 'number'
+          ? `<span class="font-bold text-slate-900">${fmt(rawPrice)}</span>`
+          : `<span class="font-semibold text-slate-800">${typeof rawPrice === 'number' ? fmt(rawPrice) : rawPrice}</span>`;
+
+      return `<div class="grid grid-cols-[130px_1fr_auto] gap-x-4 items-start py-2 border-b border-slate-100 last:border-0">
+        <span class="text-sm text-slate-500">${e.date || '—'}</span>
+        <span class="text-sm ${eventCls}">${e.event || '—'}</span>
+        <span class="text-sm text-right">${priceDisplay}</span>
+      </div>`;
+    }).join('');
+
+    return mlsHdr + evRows;
+  }).join('');
+
+  // Price appreciation badge
+  const prices = events.filter(e => /closed|sold/i.test(e.event||'')).map(e => e.price).filter(Number.isFinite);
+  let badge = '';
+  if (prices.length > 1) {
+    const pct = Math.round((prices[0] - prices[prices.length-1]) / prices[prices.length-1] * 100);
+    const cls = pct >= 0 ? 'badge-positive' : 'badge-negative';
+    badge = `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${cls} ml-auto">${pct >= 0 ? '+' : ''}${pct}% over ${prices.length} sales</span>`;
+  }
+
+  if (badge) {
+    const heading = $('historyTableWrap')?.previousElementSibling;
+    const h4 = $('historyTableWrap')?.parentElement?.querySelector('h4');
+    if (h4) h4.insertAdjacentHTML('afterend', `<div class="flex mb-2">${badge}</div>`);
+  }
+
+  wrap.innerHTML = header + rowsHtml;
+}
+
+// Fallback when page fetch fails — show just the Closed events we have
+function renderFallbackHistory(g) {
+  const wrap = $('historyTableBody');
+  if (!wrap) return;
+
+  const header = `
+    <div class="grid grid-cols-[130px_1fr_auto] gap-x-4 pb-1.5 mb-1 border-b-2 border-slate-200">
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Date</span>
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide">Event</span>
+      <span class="text-xs font-semibold text-slate-400 uppercase tracking-wide text-right">Price</span>
+    </div>`;
+
+  const rowsHtml = (g.events || []).map((e, i) => {
+    const mlsHdr = e.mls_number
+      ? `<div class="text-xs font-medium text-slate-500 bg-slate-200/70 rounded px-2.5 py-1 ${i > 0 ? 'mt-3' : ''} mb-1">MLS# ${e.mls_number}</div>`
+      : (i > 0 ? '<div class="border-t border-slate-200 mt-3 mb-2"></div>' : '');
+
+    const closedRow = `<div class="grid grid-cols-[130px_1fr_auto] gap-x-4 items-start py-2 border-b border-slate-100">
+      <span class="text-sm text-slate-500">${fmtDate(e.date)}</span>
+      <span class="text-sm font-semibold text-slate-900">Closed</span>
+      <span class="text-sm font-bold text-slate-900 text-right">${fmt(e.price)}${e.price_per_sqft ? `<span class="font-normal text-slate-400 text-xs ml-1">${fmt(e.price_per_sqft)}/sqft</span>` : ''}</span>
+    </div>`;
+
+    return mlsHdr + closedRow;
+  }).join('');
+
+  wrap.innerHTML = header + rowsHtml +
+    `<p class="text-xs text-slate-400 mt-2 italic">Full event history unavailable — property page could not be loaded.</p>`;
 }
 
 // ─── Error ──────────────────────────────────────────────────────────────────────

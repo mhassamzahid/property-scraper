@@ -157,6 +157,148 @@ def make_gis_url(market, region_id, region_type, page_num=1, sold_within_days=No
         url += f"&sold_within_days={sold_within_days}"
     return url
 
+_HISTORY_JS = """
+() => {
+    // Method 1: React server state
+    try {
+        const cache = window.__reactServerState
+            ?.InitialContext?.['ReactServerAgent.cache']?.dataCache;
+        if (cache) {
+            for (const [k, v] of Object.entries(cache)) {
+                const p = v?.result?.payload;
+                if (!p) continue;
+                for (const field of ['propertyHistoryInfo', 'saleHistoryInfo',
+                                     'timeline', 'propertyTimeline', 'historyData']) {
+                    const c = p[field];
+                    if (!c) continue;
+                    const arr = Array.isArray(c) ? c : (c.events || c.timeline || c.items);
+                    if (Array.isArray(arr) && arr.length > 0)
+                        return {source: 'state', data: arr};
+                }
+            }
+        }
+    } catch(e) {}
+
+    // Method 2: DOM — look for the sale history table
+    try {
+        const rows = [];
+        const selectors = [
+            '[data-rf-test-id="sale-price-history"] tr',
+            '.SaleAndTaxHistoryContainer tr',
+            '.SalePriceHistory tr',
+            '.historyCard tr',
+        ];
+        let found = false;
+        for (const sel of selectors) {
+            const els = document.querySelectorAll(sel);
+            if (els.length > 0) {
+                els.forEach(row => {
+                    const tds = row.querySelectorAll('td');
+                    if (tds.length >= 2) {
+                        rows.push({
+                            eventDate:   tds[0]?.innerText?.trim() || null,
+                            description: tds[1]?.innerText?.trim() || null,
+                            price:       tds[2]?.innerText?.trim() || null,
+                            source:      'dom',
+                        });
+                    }
+                });
+                if (rows.length) { found = true; break; }
+            }
+        }
+        // Broad fallback: any tbody rows whose first cell looks like a date
+        if (!found) {
+            document.querySelectorAll('tbody tr').forEach(row => {
+                const tds = row.querySelectorAll('td');
+                if (tds.length >= 2) {
+                    const d = tds[0]?.innerText?.trim() || '';
+                    if (/[A-Za-z]+ \\d+, \\d{4}/.test(d)) {
+                        rows.push({
+                            eventDate:   d,
+                            description: tds[1]?.innerText?.trim() || null,
+                            price:       tds[2]?.innerText?.trim() || null,
+                            source:      'dom',
+                        });
+                    }
+                }
+            });
+        }
+        if (rows.length) return {source: 'dom', data: rows};
+    } catch(e) {}
+
+    return null;
+}
+"""
+
+def _parse_history_event(e: dict) -> dict:
+    """Normalise a Redfin history event from API or DOM scraping."""
+    ts = e.get("eventDate") or e.get("date") or e.get("timestamp")
+    date = None
+    if isinstance(ts, (int, float)) and ts > 1_000_000_000:
+        date = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    elif isinstance(ts, str):
+        date = ts
+    # Redfin API wraps values in {"value": X, "level": N} dicts — unwrap them
+    price_raw = e.get("price") or e.get("amount")
+    price = _v(price_raw) if isinstance(price_raw, dict) else price_raw
+    mls_raw = e.get("mlsId") or e.get("mlsNumber") or e.get("mls_number")
+    mls = _v(mls_raw) if isinstance(mls_raw, dict) else mls_raw
+    return {
+        "date":       date,
+        "event":      e.get("description") or e.get("event") or e.get("eventType") or "",
+        "price":      price,
+        "mls_number": str(mls) if mls is not None else None,
+        "source":     e.get("source", "api"),
+    }
+
+async def fetch_property_history(page, redfin_url: str) -> list[dict]:
+    """
+    Fetch full sale & listing history for a Redfin property.
+
+    Strategy (fastest → most reliable):
+      1. Redfin propertyHistoryInfo JSON API — lightweight, same-origin fetch
+         from the already-warmed browser session, no extra page navigation.
+      2. React server-state / DOM scrape of the property page — fallback only.
+    """
+    if not redfin_url:
+        return []
+
+    # ── Method 1: lightweight JSON API ────────────────────────────────────────
+    prop_id_m = re.search(r'/home/(\d+)', redfin_url)
+    if prop_id_m:
+        prop_id = prop_id_m.group(1)
+        api_url = (
+            f"https://www.redfin.com/stingray/api/home/details/propertyHistoryInfo"
+            f"?propertyId={prop_id}&accessLevel=3"
+        )
+        try:
+            _, data = await fetch_json_in_page(page, api_url)
+            if data:
+                payload = data.get("payload") or {}
+                events = (
+                    payload.get("events") or
+                    payload.get("propertyHistoryInfo") or
+                    payload.get("saleHistory") or
+                    []
+                )
+                if events:
+                    return [_parse_history_event(e) for e in events if e]
+        except Exception:
+            pass
+
+    # ── Method 2: navigate to property page and scrape ─────────────────────────
+    try:
+        await page.goto(redfin_url, wait_until="domcontentloaded", timeout=25_000)
+        await asyncio.sleep(3)
+        result = await page.evaluate(_HISTORY_JS)
+        if result and result.get("data"):
+            return [_parse_history_event(e) for e in result["data"] if e]
+    except Exception:
+        pass
+
+    return []
+
+
 async def gis_fetch_all(page, market, region_id, region_type, sold_within_days=None, max_pages=5) -> list[dict]:
     """Paginate the GIS API and return all homes."""
     all_homes = []
@@ -171,7 +313,44 @@ async def gis_fetch_all(page, market, region_id, region_type, sold_within_days=N
         all_homes.extend(homes)
         if len(homes) < 350:
             break
-        # For sold searches stop when no more closed homes
+        if sold_within_days and not any(h.get("mlsStatus") in ("Closed", "Sold") for h in homes):
+            break
+        await asyncio.sleep(random.uniform(0.8, 1.5))
+    return all_homes
+
+
+def make_viewport_gis_url(market, lat, lng, radius_miles=3.0, page_num=1, sold_within_days=None):
+    """GIS URL using a lat/lng bounding box instead of region_id — always returns
+    properties physically near the given coordinates, no matter how large the market."""
+    mpt = "99" if sold_within_days else "1"
+    lat_d = radius_miles / 69.0
+    lng_d = radius_miles / (math.cos(math.radians(lat)) * 69.0)
+    url = (
+        f"{GIS_BASE}?al=1&include_nearby_homes=true&market={market}&mpt={mpt}"
+        f"&lat_max={lat + lat_d:.6f}&lat_min={lat - lat_d:.6f}"
+        f"&lon_max={lng + lng_d:.6f}&lon_min={lng - lng_d:.6f}"
+        f"&page_number={page_num}&start={(page_num - 1) * 350}&status=9{GIS_COMMON}"
+    )
+    if sold_within_days:
+        url += f"&sold_within_days={sold_within_days}"
+    return url
+
+
+async def gis_viewport_fetch(page, market, lat, lng,
+                             radius_miles=3.0, sold_within_days=None, max_pages=5) -> list[dict]:
+    """Fetch listings inside a geographic bounding box centred on lat/lng."""
+    all_homes = []
+    for pg in range(1, max_pages + 1):
+        url = make_viewport_gis_url(market, lat, lng, radius_miles, pg, sold_within_days)
+        _, data = await fetch_json_in_page(page, url)
+        if not data:
+            break
+        homes = data.get("payload", {}).get("homes", [])
+        if not homes:
+            break
+        all_homes.extend(homes)
+        if len(homes) < 350:
+            break
         if sold_within_days and not any(h.get("mlsStatus") in ("Closed", "Sold") for h in homes):
             break
         await asyncio.sleep(random.uniform(0.8, 1.5))
@@ -183,8 +362,9 @@ async def gis_fetch_all(page, market, region_id, region_type, sold_within_days=N
 async def geocode(page, address: str) -> dict:
     """
     Geocode an address via OpenStreetMap Nominatim.
-    On failure, retries with progressively broader queries (street+city, then city+state)
-    so minor typos or missing unit numbers don't hard-crash the pipeline.
+    Unit/apt numbers are stripped before querying — they confuse geocoders and
+    are irrelevant for lat/lng lookup. Falls back from full address → street+city
+    → city+state so minor typos don't crash the pipeline.
     """
     def _encode(q: str) -> str:
         return q.replace(" ", "+").replace(",", "%2C")
@@ -202,16 +382,24 @@ async def geocode(page, address: str) -> dict:
             "state": addr.get("state", ""),
         }
 
-    # Build a set of fallback queries from most to least specific
-    import re as _re
-    parts = [p.strip() for p in _re.split(r",|\s{2,}", address) if p.strip()]
-    queries = [address]                          # 1. full address as given
-    if len(parts) >= 2:
-        queries.append(", ".join(parts[-2:]))    # 2. last two parts (e.g. "City State Zip")
-    if len(parts) >= 1:
-        queries.append(parts[-1])                # 3. last part only (city/state)
+    # Strip unit/apt/suite/floor numbers — they cause Nominatim to return imprecise
+    # centroid results instead of the actual building coordinates.
+    clean = re.sub(
+        r",?\s*\b(unit|apt|apartment|suite|ste|floor|fl|#)\s*[\w\-]+\b",
+        "", address, flags=re.IGNORECASE,
+    ).strip()
+    clean = re.sub(r"\s{2,}", " ", clean).strip(" ,")
 
-    last_err = ""
+    # Build fallback queries: cleaned address → street+city → city+state
+    parts = [p.strip() for p in re.split(r",|\s{2,}", clean) if p.strip()]
+    queries = [clean]
+    if clean != address:
+        queries.append(address)               # also try original in case clean over-strips
+    if len(parts) >= 2:
+        queries.append(", ".join(parts[-2:])) # last two parts: "City, State ZIP"
+    if len(parts) >= 1:
+        queries.append(parts[-1])             # last part: "State ZIP"
+
     for attempt, q in enumerate(queries, 1):
         encoded = _encode(q)
         url = f"https://nominatim.openstreetmap.org/search?q={encoded}&format=json&limit=1&addressdetails=1"
@@ -220,8 +408,13 @@ async def geocode(page, address: str) -> dict:
         if result:
             if attempt > 1:
                 print(f"    (geocoded using fallback query: '{q}')")
+            # Nominatim sometimes omits postcode for unit-level results — extract from input
+            if not result.get("zip"):
+                m = re.search(r"\b(\d{5})\b", address)
+                if m:
+                    result["zip"] = m.group(1)
+                    print(f"    (zip extracted from input address: {result['zip']})")
             return result
-        last_err = q
 
     raise RuntimeError(
         f"\n  Geocoding failed for: {address!r}\n"
@@ -278,15 +471,23 @@ async def discover_region(page, zip_code: str, city: str, state: str) -> dict:
             "region_type": int(m_region_t.group(1)),
         }
 
-    # Attempt 1: zip code page (tight geographic scope)
-    result = await _try_page(f"https://www.redfin.com/zipcode/{zip_code}")
+    state_abbr = STATE_ABBR.get(state, state[:2].upper())
+    city_slug  = city.replace(" ", "_")
+
+    # Attempt 1: zip code page — most precise scope, skip if zip unknown
+    if zip_code and len(zip_code) >= 4:
+        result = await _try_page(f"https://www.redfin.com/zipcode/{zip_code}")
+        if result:
+            return result
+
+    # Attempt 2: canonical city URL  e.g. /IL/Chicago or /WA/Seattle
+    result = await _try_page(f"https://www.redfin.com/{state_abbr}/{city_slug}")
     if result:
         return result
 
-    # Attempt 2: city page  e.g. /city/16163/WA/Seattle
-    state_abbr = STATE_ABBR.get(state, state[:2].upper())
-    city_slug = city.replace(" ", "_")
-    result = await _try_page(f"https://www.redfin.com/{state_abbr}/{city_slug}")
+    # Attempt 3: search-style URL fallback (some cities need the slug with hyphens)
+    city_hyphen = city.replace(" ", "-")
+    result = await _try_page(f"https://www.redfin.com/{state_abbr}/{city_hyphen}")
     if result:
         return result
 
@@ -569,23 +770,69 @@ async def run_pipeline(address: str, radius_miles: float, tolerance: float, sold
             region = await discover_region(page, geo["zip"], geo["city"], geo["state"])
             _log(f"      market={region['market']}  region_id={region['region_id']}  region_type={region['region_type']}")
 
-            # ── 3. Fetch all listings in the region ───────────────────────────
-            _log(f"[3/7] Fetching listings...")
-            raw_listings = await gis_fetch_all(page, region["market"], region["region_id"], region["region_type"], max_pages=3)
+            # ── 3. Fetch listings — zip-level region first, viewport as fallback ──
+            # discover_region navigates to /zipcode/ZIP, so region_id is zip-scoped
+            # (e.g. 60615 = Hyde Park only, not all of Chicago). This avoids the
+            # North-Side-vs-South-Side problem that comes from city-level region_id.
+            fetch_radius = radius_miles + 1.0
+            _log(f"[3/7] Fetching listings (region_id={region['region_id']} type={region['region_type']})...")
+            raw_listings = await gis_fetch_all(
+                page, region["market"], region["region_id"], region["region_type"],
+                max_pages=5,
+            )
+            if not raw_listings:
+                _log(f"      Region GIS returned 0 — trying viewport fallback ({fetch_radius:.1f} mi)...")
+                raw_listings = await gis_viewport_fetch(
+                    page, region["market"], geo["lat"], geo["lng"],
+                    radius_miles=fetch_radius, max_pages=4,
+                )
             all_props = [parse_home(h) for h in raw_listings]
-            _log(f"      {len(all_props)} properties from Redfin")
+            _log(f"      {len(all_props)} raw properties from Redfin")
 
             nearby = filter_nearby(all_props, geo["lat"], geo["lng"], radius_miles)
             _log(f"      {len(nearby)} within {radius_miles} mile(s)")
 
             # ── 4. Identify subject property ──────────────────────────────────
             _log(f"[4/7] Identifying subject property...")
-            subject = find_subject_in_listings(all_props, geo["lat"], geo["lng"])
-            if subject:
-                dist = haversine_miles(geo["lat"], geo["lng"], subject.get("latitude") or 0, subject.get("longitude") or 0)
-                match_note = "exact match" if dist < 0.05 else f"closest listing ({dist:.2f} mi)"
-                _log(f"      {subject.get('street')}  [{match_note}]  {fmt_price(subject.get('price'))}")
-            else:
+
+            # Extract unit number and street number from input for precise matching
+            _input_unit_m = re.search(
+                r'\b(?:unit|apt|apartment|suite|ste|#)\s*([\w\-]+)', address, re.IGNORECASE
+            )
+            _input_unit = re.sub(r'[^A-Z0-9]', '', _input_unit_m.group(1).upper()) if _input_unit_m else None
+            _input_num_m = re.match(r'^(\d+)', address.strip())
+            _input_street_num = _input_num_m.group(1) if _input_num_m else None
+
+            subject = None
+
+            # Priority 1: exact unit+building match — avoids picking a neighbour unit
+            if _input_unit:
+                for p in all_props:
+                    # Redfin sometimes stores unit as "Unit 1009B" or "#2212".
+                    # Strip the prefix word then keep only alphanumerics for comparison.
+                    raw_unit = re.sub(
+                        r'\b(?:unit|apt|apartment|suite|ste)\b', '', (p.get("unit") or ""),
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    found_unit = re.sub(r'[^A-Z0-9]', '', raw_unit.upper())
+                    if found_unit != _input_unit:
+                        continue
+                    # Also verify same building number so we don't match "1009B" at a different address
+                    found_num_m = re.match(r'^(\d+)', (p.get("street") or "").strip())
+                    if _input_street_num and found_num_m and found_num_m.group(1) != _input_street_num:
+                        continue
+                    subject = p
+                    _log(f"      Exact unit match: {p.get('street')} #{p.get('unit')}  {fmt_price(p.get('price'))}")
+                    break
+
+            # Priority 2: closest listing by coordinates
+            if not subject:
+                subject = find_subject_in_listings(all_props, geo["lat"], geo["lng"])
+                if subject:
+                    dist = haversine_miles(geo["lat"], geo["lng"], subject.get("latitude") or 0, subject.get("longitude") or 0)
+                    _log(f"      {subject.get('street')}  [closest, {dist:.3f} mi]  {fmt_price(subject.get('price'))}")
+
+            if not subject:
                 _log("      Subject not found in active listings (off-market)")
                 subject = {
                     "property_id": None, "listing_id": None, "mls_number": None,
@@ -606,10 +853,18 @@ async def run_pipeline(address: str, radius_miles: float, tolerance: float, sold
             comps = filter_comparables(subject, nearby, tolerance)
             _log(f"      {len(comps)} comparables found")
 
-            # ── 6. Fetch recent sales in the area ─────────────────────────────
+            # ── 6. Fetch recent sales — same zip region, viewport fallback ────────
             _log(f"[6/7] Fetching recent sales (last {sold_days} days)...")
-            raw_sales = await gis_fetch_all(page, region["market"], region["region_id"], region["region_type"],
-                                            sold_within_days=sold_days, max_pages=5)
+            raw_sales = await gis_fetch_all(
+                page, region["market"], region["region_id"], region["region_type"],
+                sold_within_days=sold_days, max_pages=5,
+            )
+            if not raw_sales:
+                _log(f"      Region GIS (sales) returned 0 — trying viewport fallback...")
+                raw_sales = await gis_viewport_fetch(
+                    page, region["market"], geo["lat"], geo["lng"],
+                    radius_miles=fetch_radius, sold_within_days=sold_days, max_pages=5,
+                )
             all_sales  = [parse_home(h) for h in raw_sales if h.get("mlsStatus") in ("Closed", "Sold")]
             area_sales = filter_nearby(all_sales, geo["lat"], geo["lng"], radius_miles)
             _log(f"      {len(area_sales)} sales within {radius_miles} mile(s)")
